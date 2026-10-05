@@ -2,8 +2,8 @@
 
 MVP на aiogram 3.x + SQLite + aiohttp postback.
 
-Активация пользователя = **только** server-to-server postback события `registration`.
-Клик по партнёрской ссылке сам по себе пользователя не активирует.
+Активация = **только** postback события `registration` от 1win.  
+Клик по рефке сам по себе пользователя не активирует.
 
 ## Структура
 
@@ -26,13 +26,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Заполните в `.env`:
+В `.env` заполните:
 
-- `BOT_TOKEN`
-- `ADMIN_ID`
-- `LANDING_URL` (уже есть дефолт 1win)
-- `PUBLIC_BASE_URL` — публичный HTTPS (не localhost)
-- `POSTBACK_SECRET` (если 1win позволяет static-параметр)
+- `BOT_TOKEN` — токен от @BotFather
+- `ADMIN_ID` — ваш Telegram ID
+- `REFERRAL_URL` — ваша рефка (уже стоит дефолт)
+- `PUBLIC_BASE_URL` — HTTPS-адрес сервера с ботом (не localhost)
+- `POSTBACK_SECRET` — любой пароль, который сами придумаете
 
 ## Запуск
 
@@ -40,37 +40,37 @@ cp .env.example .env
 python bot.py
 ```
 
-Бот одновременно:
+## Кнопка регистрации
 
-1. принимает Telegram updates (polling);
-2. слушает `GET/POST /postback` на `HTTP_PORT`.
-
-## Ссылка регистрации
-
-Кнопка «Пройти регистрацию» ведёт **сразу** на вашу рефку 1win:
+Ведёт **сразу** на вашу рефку (без прокладки):
 
 ```
 https://r1wtvmb.life/casino/list?open=register&p=fiyw&sub1=<CLICK_ID>
 ```
 
-Прокладки нет. `CLICK_ID` = UUID в SQLite (не Telegram ID).
+## Что вписать в кабинет 1win
 
-## Что вписать в кабинет 1win (простыми словами)
-
-1. Поднимите бота на сервере с HTTPS (например `https://myserver.com`).
-2. В `.env` укажите:
-   - `PUBLIC_BASE_URL=https://myserver.com`
-   - `POSTBACK_SECRET=любой_пароль`
-   - `REFERRAL_URL=https://r1wtvmb.life/casino/list?open=register&p=fiyw`
-3. В кабинете 1win откройте настройку postback.
-4. В поле **«Ссылка на постбэк события — Регистрация»** вставьте:
+В поле **«Ссылка на постбэк события — Регистрация»**:
 
 ```
-https://myserver.com/postback?click_id={sub1}&event=registration&secret=любой_пароль
+https://ВАШ-ДОМЕН/postback?click_id={sub1}&event=registration&secret=ВАШ_ПАРОЛЬ
 ```
 
-(тот же домен, что в `PUBLIC_BASE_URL`, тот же пароль, что в `POSTBACK_SECRET`)
+Пример, если сервер `https://myserver.com`, а пароль `qwerty123`:
 
-5. Поля «Доход» / депозит **не трогайте** — для бота нужна только **Регистрация**.
+```
+https://myserver.com/postback?click_id={sub1}&event=registration&secret=qwerty123
+```
 
-Если макрос в кабинете называется не `{sub1}`, а иначе — посмотрите подсказку в 1win и напишите нам точное имя.
+Поля «Доход» / депозит **не заполняйте** для бота — нужна только **Регистрация**.
+
+### Тест
+
+```bash
+curl "https://myserver.com/postback?click_id=ТЕСТОВЫЙ_CLICK_ID&event=registration&secret=qwerty123"
+```
+
+## Админ-команды
+
+- `/stats` — статистика
+- `/users` — последние пользователи
