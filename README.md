@@ -47,45 +47,30 @@ python bot.py
 
 ## Ссылка регистрации
 
-Для каждого пользователя:
+Кнопка «Пройти регистрацию» ведёт **сразу** на вашу рефку 1win:
 
 ```
 https://r1wtvmb.life/casino/list?open=register&p=fiyw&sub1=<CLICK_ID>
 ```
 
-`CLICK_ID` = UUID, хранится в SQLite, **не** Telegram ID.
+Прокладки нет. `CLICK_ID` = UUID в SQLite (не Telegram ID).
 
-## Postback для кабинета 1win
+## Что вписать в кабинет 1win (простыми словами)
 
-В поле **«Ссылка на постбэк события — Регистрация»**:
+1. Поднимите бота на сервере с HTTPS (например `https://myserver.com`).
+2. В `.env` укажите:
+   - `PUBLIC_BASE_URL=https://myserver.com`
+   - `POSTBACK_SECRET=любой_пароль`
+   - `REFERRAL_URL=https://r1wtvmb.life/casino/list?open=register&p=fiyw`
+3. В кабинете 1win откройте настройку postback.
+4. В поле **«Ссылка на постбэк события — Регистрация»** вставьте:
 
 ```
-https://YOUR-DOMAIN.COM/postback?click_id={sub1}&event=registration&secret=YOUR_SECRET
+https://myserver.com/postback?click_id={sub1}&event=registration&secret=любой_пароль
 ```
 
-Подставьте свой `PUBLIC_BASE_URL` и `POSTBACK_SECRET`.
-Точное имя макроса `{sub1}` уточните в кабинете 1win.
+(тот же домен, что в `PUBLIC_BASE_URL`, тот же пароль, что в `POSTBACK_SECRET`)
 
-**Не** используйте postback «Доход» / депозит для активации бота.
+5. Поля «Доход» / депозит **не трогайте** — для бота нужна только **Регистрация**.
 
-### Тестовый запрос
-
-```bash
-curl "https://YOUR-DOMAIN.COM/postback?click_id=USER_CLICK_ID&event=registration&secret=YOUR_SECRET"
-```
-
-### Смена формата параметров
-
-В `.env` или константах в начале `bot.py`:
-
-- `POSTBACK_CLICK_ID_PARAM`
-- `POSTBACK_EVENT_PARAM`
-- `POSTBACK_SECRET_PARAM`
-- `POSTBACK_SUCCESS_EVENT`
-
-Логика обработки — функция `process_postback()` в `bot.py`.
-
-## Админ-команды
-
-- `/stats` — статистика
-- `/users` — последние пользователи
+Если макрос в кабинете называется не `{sub1}`, а иначе — посмотрите подсказку в 1win и напишите нам точное имя.

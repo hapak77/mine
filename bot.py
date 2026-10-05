@@ -52,11 +52,14 @@ LOG_PATH = BASE_DIR / "bot.log"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-# Партнёрская ссылка 1win (к ней добавится &sub1=CLICK_ID)
-LANDING_URL = os.getenv(
-    "LANDING_URL",
-    "https://r1wtvmb.life/casino/list?open=register&p=fiyw",
-).strip()
+# Реферальная ссылка 1win (кнопка ведёт сразу сюда + &sub1=CLICK_ID)
+# Поддерживаем оба имени: REFERRAL_URL (предпочтительно) и LANDING_URL
+REFERRAL_URL = (
+    os.getenv("REFERRAL_URL", "").strip()
+    or os.getenv("LANDING_URL", "").strip()
+    or "https://r1wtvmb.life/casino/list?open=register&p=fiyw"
+)
+LANDING_URL = REFERRAL_URL  # алиас для совместимости
 
 # Публичный HTTPS URL сервера (без /postback в конце), например https://example.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -172,18 +175,18 @@ def postback_endpoint_url() -> str:
     return f"{PUBLIC_BASE_URL}/postback"
 
 
-def build_landing_url(click_id: str) -> str:
+def build_referral_url(click_id: str) -> str:
     """
-    Персональная ссылка 1win с уникальным Sub ID:
+    Кнопка ведёт сразу на вашу реферальную ссылку 1win:
 
-      LANDING_URL&sub1=CLICK_ID
+      REFERRAL_URL&sub1=CLICK_ID
 
-    Telegram ID намеренно НЕ передаём — только UUID click_id.
+    Без прокладки. Telegram ID не передаём — только UUID click_id.
     """
-    if not LANDING_URL:
+    if not REFERRAL_URL:
         return ""
 
-    parsed = urlparse(LANDING_URL)
+    parsed = urlparse(REFERRAL_URL)
     query = parse_qs(parsed.query, keep_blank_values=True)
     query["sub1"] = [click_id]
     new_query = urlencode({k: v[-1] for k, v in query.items()})
@@ -515,8 +518,13 @@ _pending_notifications: dict[int, asyncio.Task] = {}
 # ──────────────────────────────────────────────
 
 
+def build_landing_url(click_id: str) -> str:
+    """Алиас: то же самое, что build_referral_url."""
+    return build_referral_url(click_id)
+
+
 def kb_register(click_id: str) -> InlineKeyboardMarkup:
-    url = build_landing_url(click_id)
+    url = build_referral_url(click_id)
     if url:
         buttons = [[InlineKeyboardButton(text="🔓 Пройти регистрацию", url=url)]]
     else:
@@ -700,7 +708,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
                 logger.debug(
                     "Registration link for %s: %s",
                     tg.id,
-                    build_landing_url(user["click_id"]),
+                    build_referral_url(user["click_id"]),
                 )
     except Exception as exc:  # noqa: BLE001
         logger.exception("cmd_start error: %s", exc)
@@ -758,7 +766,7 @@ async def cmd_users(message: Message) -> None:
 
 @dp.callback_query(F.data == "register_no_url")
 async def cb_register_no_url(callback: CallbackQuery) -> None:
-    await callback.answer("LANDING_URL не задан. Укажите его в .env", show_alert=True)
+    await callback.answer("REFERRAL_URL не задан. Укажите его в .env", show_alert=True)
 
 
 @dp.callback_query(F.data == "info")
@@ -1187,8 +1195,8 @@ async def main() -> None:
     if url_error:
         raise SystemExit(url_error)
 
-    if not LANDING_URL:
-        raise SystemExit("LANDING_URL не задан. Укажите партнёрскую ссылку 1win в .env")
+    if not REFERRAL_URL:
+        raise SystemExit("REFERRAL_URL не задан. Укажите реферальную ссылку 1win в .env")
 
     db.init()
     images = list_signal_images()
@@ -1196,7 +1204,7 @@ async def main() -> None:
     if not images:
         logger.warning("Папка signals/ пуста — прогнозы выдавать нечего")
 
-    logger.info("1win landing base: %s", LANDING_URL)
+    logger.info("1win referral URL: %s", REFERRAL_URL)
     logger.info("Postback URL for 1win cabinet: %s", postback_endpoint_url())
     logger.info(
         "Postback params: %s={sub1} %s=%s",
