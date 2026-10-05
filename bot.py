@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-MineSlot Signal Bot — MVP на aiogram 3.x + aiohttp.
+MineSlot Signal Bot — Telegram ↔ 1win postback MVP (aiogram 3.x + aiohttp).
+
 Запуск: python bot.py
+
+Активация пользователя = ТОЛЬКО server-to-server postback от 1win
+(событие registration). Клик по ссылке / открытие сайта НЕ активируют.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -17,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -47,11 +52,27 @@ LOG_PATH = BASE_DIR / "bot.log"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
-LANDING_URL = os.getenv("LANDING_URL", "").strip()
-POSTBACK_URL = os.getenv("POSTBACK_URL", "").strip()  # справочно: URL, который вы дадите партнёрке
+# Партнёрская ссылка 1win (к ней добавится &sub1=CLICK_ID)
+LANDING_URL = os.getenv(
+    "LANDING_URL",
+    "https://r1wtvmb.life/casino/list?open=register&p=fiyw",
+).strip()
+
+# Публичный HTTPS URL сервера (без /postback в конце), например https://example.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
-POSTBACK_SUCCESS_STATUS = os.getenv("POSTBACK_SUCCESS_STATUS", "reg").strip().lower()
+
+# ── ЕДИНСТВЕННОЕ МЕСТО ДЛЯ СМЕНЫ ФОРМАТА POSTBACK 1WIN ──────────────
+# Если в кабинете 1win макросы/имена параметров другие — меняйте здесь
+# (или через .env: POSTBACK_CLICK_ID_PARAM / POSTBACK_EVENT_PARAM /
+#  POSTBACK_SECRET_PARAM / POSTBACK_SUCCESS_EVENT).
+POSTBACK_CLICK_ID_PARAM = os.getenv("POSTBACK_CLICK_ID_PARAM", "click_id").strip()
+POSTBACK_EVENT_PARAM = os.getenv("POSTBACK_EVENT_PARAM", "event").strip()
+POSTBACK_SECRET_PARAM = os.getenv("POSTBACK_SECRET_PARAM", "secret").strip()
+POSTBACK_SUCCESS_EVENT = os.getenv("POSTBACK_SUCCESS_EVENT", "registration").strip().lower()
+# ────────────────────────────────────────────────────────────────────
+
 POSTBACK_ALLOWED_IPS = {
     ip.strip()
     for ip in os.getenv("POSTBACK_ALLOWED_IPS", "").split(",")
@@ -61,16 +82,22 @@ POSTBACK_ALLOWED_IPS = {
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0").strip()
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8080") or "8080")
 
-ACTIVATION_NOTIFICATION_DELAY = int(os.getenv("ACTIVATION_NOTIFICATION_DELAY", "120") or "120")
+ACTIVATION_NOTIFICATION_DELAY = int(
+    os.getenv("ACTIVATION_NOTIFICATION_DELAY", "120") or "120"
+)
 SIGNAL_LIFETIME = int(os.getenv("SIGNAL_LIFETIME", "240") or "240")
-ADMIN_NOTIFY_ON_SIGNAL = os.getenv("ADMIN_NOTIFY_ON_SIGNAL", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+ADMIN_NOTIFY_ON_NEW_USER = _env_bool("ADMIN_NOTIFY_ON_NEW_USER", "true")
+ADMIN_NOTIFY_ON_ACTIVATION = _env_bool("ADMIN_NOTIFY_ON_ACTIVATION", "true")
+ADMIN_NOTIFY_ON_SIGNAL = _env_bool("ADMIN_NOTIFY_ON_SIGNAL", "false")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+PRIVATE_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0", "192.168.", "10.")
 
 # ──────────────────────────────────────────────
 # Логирование
@@ -123,19 +150,42 @@ def format_local_date(dt: Optional[datetime] = None) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
 
 
+def validate_public_base_url(url: str) -> Optional[str]:
+    """Возвращает текст ошибки или None, если URL ок."""
+    if not url:
+        return "Для работы postback необходимо указать публичный HTTPS URL сервера."
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return "PUBLIC_BASE_URL должен быть HTTPS (1win не достучится до HTTP/localhost)."
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "PUBLIC_BASE_URL указан некорректно."
+    if any(host == m or host.startswith(m) for m in PRIVATE_HOST_MARKERS):
+        return (
+            "PUBLIC_BASE_URL не может быть localhost / 127.0.0.1 / частной сетью. "
+            "1win отправляет postback только на публичный HTTPS."
+        )
+    return None
+
+
+def postback_endpoint_url() -> str:
+    return f"{PUBLIC_BASE_URL}/postback"
+
+
 def build_landing_url(click_id: str) -> str:
     """
-    Собирает ссылку на прокладку с click_id.
+    Персональная ссылка 1win с уникальным Sub ID:
 
-    Типичная схема партнёрок: LANDING_URL?subid={click_id}
-    Telegram ID намеренно НЕ передаём напрямую — только уникальный click_id (UUID).
+      LANDING_URL&sub1=CLICK_ID
+
+    Telegram ID намеренно НЕ передаём — только UUID click_id.
     """
     if not LANDING_URL:
         return ""
 
     parsed = urlparse(LANDING_URL)
     query = parse_qs(parsed.query, keep_blank_values=True)
-    query["subid"] = [click_id]
+    query["sub1"] = [click_id]
     new_query = urlencode({k: v[-1] for k, v in query.items()})
     return urlunparse(parsed._replace(query=new_query))
 
@@ -193,11 +243,11 @@ class Database:
                     click_id TEXT NOT NULL UNIQUE,
                     start_param TEXT,
                     is_activated INTEGER NOT NULL DEFAULT 0,
+                    activation_notification_sent INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     activated_at TEXT,
                     last_activity TEXT,
-                    signals_count INTEGER NOT NULL DEFAULT 0,
-                    activation_notified INTEGER NOT NULL DEFAULT 0
+                    signals_count INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS signals (
@@ -209,21 +259,37 @@ class Database:
                     FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS postback_log (
+                CREATE TABLE IF NOT EXISTS postbacks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     click_id TEXT,
-                    raw_query TEXT,
-                    status TEXT,
+                    event TEXT,
+                    raw_data TEXT,
                     ip TEXT,
-                    accepted INTEGER NOT NULL DEFAULT 0,
-                    reason TEXT,
-                    created_at TEXT NOT NULL
+                    received_at TEXT NOT NULL,
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    result TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_users_click_id ON users(click_id);
                 CREATE INDEX IF NOT EXISTS idx_signals_telegram_id ON signals(telegram_id);
+                CREATE INDEX IF NOT EXISTS idx_postbacks_click_id ON postbacks(click_id);
                 """
             )
+            # Мягкая миграция со старой схемы (activation_notified → activation_notification_sent)
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "activation_notification_sent" not in cols and "activation_notified" in cols:
+                conn.execute(
+                    "ALTER TABLE users RENAME COLUMN activation_notified "
+                    "TO activation_notification_sent"
+                )
+            elif "activation_notification_sent" not in cols:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN activation_notification_sent "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             conn.commit()
         logger.info("Database initialized: %s", self.path)
 
@@ -268,13 +334,19 @@ class Database:
             """
             INSERT INTO users (
                 telegram_id, username, first_name, click_id, start_param,
-                is_activated, created_at, last_activity, signals_count, activation_notified
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, 0)
+                is_activated, activation_notification_sent,
+                created_at, last_activity, signals_count
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, 0)
             """,
             (telegram_id, username, first_name, click_id, start_param, now, now),
         )
         user = await self.get_user(telegram_id)
         assert user is not None
+        logger.info(
+            "Generated click_id=%s for telegram_id=%s",
+            click_id,
+            telegram_id,
+        )
         return user
 
     async def touch_activity(self, telegram_id: int) -> None:
@@ -283,13 +355,16 @@ class Database:
             (dt_to_str(utcnow()), telegram_id),
         )
 
-    async def activate_user(self, click_id: str) -> Optional[sqlite3.Row]:
-        """Идемпотентная активация. Возвращает пользователя или None."""
+    async def activate_user(self, click_id: str) -> tuple[Optional[sqlite3.Row], bool]:
+        """
+        Идемпотентная активация.
+        Возвращает (user, newly_activated).
+        """
         user = await self.get_user_by_click_id(click_id)
         if user is None:
-            return None
+            return None, False
         if user["is_activated"]:
-            return user
+            return user, False
         now = dt_to_str(utcnow())
         await self.execute(
             """
@@ -299,22 +374,28 @@ class Database:
             """,
             (now, now, click_id),
         )
-        return await self.get_user_by_click_id(click_id)
+        return await self.get_user_by_click_id(click_id), True
 
-    async def mark_activation_notified(self, telegram_id: int) -> bool:
-        """Помечает, что уведомление об активации отправлено. True = пометили впервые."""
+    async def mark_activation_notification_sent(self, telegram_id: int) -> bool:
+        """True = пометили впервые (можно слать сообщение)."""
         async with self._lock:
             with closing(self._connect()) as conn:
                 cur = conn.execute(
                     """
                     UPDATE users
-                    SET activation_notified = 1
-                    WHERE telegram_id = ? AND activation_notified = 0
+                    SET activation_notification_sent = 1
+                    WHERE telegram_id = ? AND activation_notification_sent = 0
                     """,
                     (telegram_id,),
                 )
                 conn.commit()
                 return cur.rowcount > 0
+
+    async def clear_activation_notification_sent(self, telegram_id: int) -> None:
+        await self.execute(
+            "UPDATE users SET activation_notification_sent = 0 WHERE telegram_id = ?",
+            (telegram_id,),
+        )
 
     async def create_signal(self, telegram_id: int, image: str) -> sqlite3.Row:
         now = utcnow()
@@ -347,41 +428,35 @@ class Database:
     async def get_signal(self, signal_id: int) -> Optional[sqlite3.Row]:
         return await self.fetchone("SELECT * FROM signals WHERE id = ?", (signal_id,))
 
-    async def get_last_signal(self, telegram_id: int) -> Optional[sqlite3.Row]:
-        return await self.fetchone(
-            """
-            SELECT * FROM signals
-            WHERE telegram_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (telegram_id,),
-        )
-
-    async def log_postback(
+    async def insert_postback(
         self,
         click_id: Optional[str],
-        raw_query: str,
-        status: Optional[str],
+        event: Optional[str],
+        raw_data: str,
         ip: Optional[str],
-        accepted: bool,
-        reason: str,
-    ) -> None:
-        await self.execute(
-            """
-            INSERT INTO postback_log (click_id, raw_query, status, ip, accepted, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                click_id,
-                raw_query,
-                status,
-                ip,
-                1 if accepted else 0,
-                reason,
-                dt_to_str(utcnow()),
-            ),
-        )
+        processed: bool,
+        result: str,
+    ) -> int:
+        async with self._lock:
+            with closing(self._connect()) as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO postbacks
+                        (click_id, event, raw_data, ip, received_at, processed, result)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        click_id,
+                        event,
+                        raw_data,
+                        ip,
+                        dt_to_str(utcnow()),
+                        1 if processed else 0,
+                        result,
+                    ),
+                )
+                conn.commit()
+                return int(cur.lastrowid)
 
     async def stats(self) -> dict[str, int]:
         today = utcnow().strftime("%Y-%m-%d")
@@ -429,11 +504,10 @@ class Database:
 
 db = Database(DB_PATH)
 
-# Глобальные объекты — bot инициализируется в main()
 bot: Optional[Bot] = None
 dp = Dispatcher()
 
-# pending activation notifications: telegram_id -> asyncio.Task
+# telegram_id → asyncio.Task отложенного уведомления
 _pending_notifications: dict[int, asyncio.Task] = {}
 
 # ──────────────────────────────────────────────
@@ -443,20 +517,17 @@ _pending_notifications: dict[int, asyncio.Task] = {}
 
 def kb_register(click_id: str) -> InlineKeyboardMarkup:
     url = build_landing_url(click_id)
-    buttons = []
     if url:
-        buttons.append(
-            [InlineKeyboardButton(text="🔓 Пройти регистрацию", url=url)]
-        )
+        buttons = [[InlineKeyboardButton(text="🔓 Пройти регистрацию", url=url)]]
     else:
-        buttons.append(
+        buttons = [
             [
                 InlineKeyboardButton(
                     text="🔓 Пройти регистрацию",
                     callback_data="register_no_url",
                 )
             ]
-        )
+        ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -484,7 +555,7 @@ def kb_signal(signal_id: int) -> InlineKeyboardMarkup:
 
 
 # ──────────────────────────────────────────────
-# Уведомления админу / пользователю
+# Уведомления
 # ──────────────────────────────────────────────
 
 
@@ -500,12 +571,12 @@ async def notify_admin(text: str) -> None:
 
 
 async def send_activation_message(telegram_id: int) -> None:
-    """Отправляет уведомление об активации один раз."""
+    """Отправляет уведомление об активации ровно один раз."""
     if bot is None:
         logger.warning("Bot is not ready; skip activation notice for %s", telegram_id)
         return
 
-    marked = await db.mark_activation_notified(telegram_id)
+    marked = await db.mark_activation_notification_sent(telegram_id)
     if not marked:
         logger.info("Activation notice already sent for %s", telegram_id)
         return
@@ -518,23 +589,17 @@ async def send_activation_message(telegram_id: int) -> None:
         await bot.send_message(
             telegram_id,
             "✅ Регистрация завершена!\n\n"
-            "Бот активирован. Теперь вы можете получать прогнозы на ближайшие игры.",
+            "Бот активирован.\n\n"
+            "Теперь вы можете получать прогнозы.",
             reply_markup=kb_main_menu(),
         )
         logger.info("Activation notice sent to %s", telegram_id)
     except TelegramAPIError as exc:
         logger.warning("Failed to send activation notice to %s: %s", telegram_id, exc)
-        # Разрешаем повторную попытку при ошибке Telegram
-        await db.execute(
-            "UPDATE users SET activation_notified = 0 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
+        await db.clear_activation_notification_sent(telegram_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected activation notice error: %s", exc)
-        await db.execute(
-            "UPDATE users SET activation_notified = 0 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
+        await db.clear_activation_notification_sent(telegram_id)
 
 
 async def schedule_activation_notification(telegram_id: int) -> None:
@@ -559,7 +624,7 @@ async def schedule_activation_notification(telegram_id: int) -> None:
 
 
 # ──────────────────────────────────────────────
-# Handlers
+# Telegram handlers
 # ──────────────────────────────────────────────
 
 
@@ -583,24 +648,24 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
             )
             is_new = True
             logger.info(
-                "New user %s (@%s) click_id=%s start=%s",
+                "New Telegram user id=%s username=@%s click_id=%s start=%s",
                 tg.id,
                 tg.username,
                 user["click_id"],
                 start_param,
             )
-            await notify_admin(
-                "🆕 <b>Новый пользователь</b>\n\n"
-                f"ID: <code>{tg.id}</code>\n"
-                f"Username: @{tg.username or '—'}\n"
-                f"Имя: {tg.first_name or '—'}\n"
-                f"Дата: {format_local_date()}\n"
-                f"Click ID: <code>{user['click_id']}</code>\n"
-                f"Start: <code>{start_param or '—'}</code>"
-            )
+            if ADMIN_NOTIFY_ON_NEW_USER:
+                await notify_admin(
+                    "🆕 <b>Новый пользователь</b>\n\n"
+                    f"ID: <code>{tg.id}</code>\n"
+                    f"Username: @{tg.username or '—'}\n"
+                    f"Имя: {tg.first_name or '—'}\n"
+                    f"Click ID: <code>{user['click_id']}</code>\n"
+                    f"Дата: {format_local_date()}\n"
+                    f"Start: <code>{start_param or '—'}</code>"
+                )
         else:
             await db.touch_activity(tg.id)
-            # Обновляем профиль / start_param при повторном заходе с параметром
             await db.execute(
                 """
                 UPDATE users
@@ -615,9 +680,10 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         assert user is not None
 
         if user["is_activated"]:
-            # Если уведомление ещё не ушло — отправим сразу через меню, без дубля
-            if not user["activation_notified"]:
-                await db.mark_activation_notified(tg.id)
+            # Если пользователь уже открыл бота после активации —
+            # помечаем уведомление отправленным, чтобы отложенный дубль не ушёл
+            if not user["activation_notification_sent"]:
+                await db.mark_activation_notification_sent(tg.id)
             await message.answer(
                 "✅ Доступ активирован!\n\n"
                 "Теперь вы можете получать прогнозы на ближайшие игры.",
@@ -626,15 +692,22 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         else:
             await message.answer(
                 "👋 Добро пожаловать!\n\n"
-                "Для получения прогнозов необходимо сначала пройти регистрацию.\n\n"
-                "После регистрации доступ к боту будет активирован автоматически.",
+                "Для активации бота необходимо пройти регистрацию.\n\n"
+                "После успешной регистрации доступ будет активирован автоматически.",
                 reply_markup=kb_register(user["click_id"]),
             )
             if is_new:
-                logger.debug("Registration prompt shown to new user %s", tg.id)
+                logger.debug(
+                    "Registration link for %s: %s",
+                    tg.id,
+                    build_landing_url(user["click_id"]),
+                )
     except Exception as exc:  # noqa: BLE001
         logger.exception("cmd_start error: %s", exc)
-        await message.answer("Произошла ошибка. Попробуйте позже.")
+        try:
+            await message.answer("Произошла ошибка. Попробуйте позже.")
+        except TelegramAPIError:
+            pass
 
 
 @dp.message(Command("stats"))
@@ -646,12 +719,12 @@ async def cmd_stats(message: Message) -> None:
         await message.answer(
             "📊 <b>Статистика</b>\n\n"
             f"Всего пользователей: <b>{s['total']}</b>\n"
-            f"Активированных: <b>{s['activated']}</b>\n"
-            f"Неактивированных: <b>{s['not_activated']}</b>\n"
-            f"Пользователей за сегодня: <b>{s['today_users']}</b>\n"
-            f"Активаций за сегодня: <b>{s['today_activations']}</b>\n"
+            f"Активировано: <b>{s['activated']}</b>\n"
+            f"Не активировано: <b>{s['not_activated']}</b>\n"
+            f"Новых сегодня: <b>{s['today_users']}</b>\n"
+            f"Активаций сегодня: <b>{s['today_activations']}</b>\n"
             f"Всего прогнозов: <b>{s['total_signals']}</b>\n"
-            f"Прогнозов за сегодня: <b>{s['today_signals']}</b>",
+            f"Прогнозов сегодня: <b>{s['today_signals']}</b>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:  # noqa: BLE001
@@ -673,8 +746,9 @@ async def cmd_users(message: Message) -> None:
             status = "✅" if row["is_activated"] else "⏳"
             uname = f"@{row['username']}" if row["username"] else "—"
             lines.append(
-                f"{status} <code>{row['telegram_id']}</code> {uname} "
-                f"| {row['first_name'] or '—'} | {row['created_at']}"
+                f"{status} <code>{row['telegram_id']}</code> {uname}\n"
+                f"   click_id=<code>{row['click_id']}</code>\n"
+                f"   {row['created_at']}"
             )
         await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:  # noqa: BLE001
@@ -684,10 +758,7 @@ async def cmd_users(message: Message) -> None:
 
 @dp.callback_query(F.data == "register_no_url")
 async def cb_register_no_url(callback: CallbackQuery) -> None:
-    await callback.answer(
-        "LANDING_URL не задан. Укажите его в .env",
-        show_alert=True,
-    )
+    await callback.answer("LANDING_URL не задан. Укажите его в .env", show_alert=True)
 
 
 @dp.callback_query(F.data == "info")
@@ -702,9 +773,9 @@ async def cb_info(callback: CallbackQuery) -> None:
     await db.touch_activity(callback.from_user.id)
     text = (
         "ℹ️ <b>Информация</b>\n\n"
-        "Бот выдаёт случайный прогноз на ближайшую игру.\n"
+        "Бот выдаёт случайный контент-прогноз на ближайшую игру.\n"
         f"Каждый прогноз действует {SIGNAL_LIFETIME // 60} минуты.\n\n"
-        "После регистрации доступ открывается автоматически."
+        "Доступ открывается автоматически после подтверждённой регистрации."
     )
     try:
         if callback.message:
@@ -738,13 +809,12 @@ async def cb_back_main(callback: CallbackQuery) -> None:
     )
     try:
         if callback.message:
-            # Если сообщение с фото — удаляем и шлём новое текстовое меню
             if callback.message.photo:
                 try:
                     await callback.message.delete()
                 except TelegramAPIError:
                     pass
-                await bot.send_message(
+                await bot.send_message(  # type: ignore[union-attr]
                     callback.from_user.id,
                     text,
                     reply_markup=kb_main_menu(),
@@ -754,15 +824,18 @@ async def cb_back_main(callback: CallbackQuery) -> None:
     except TelegramAPIError as exc:
         logger.warning("cb_back_main failed: %s", exc)
         try:
-            await bot.send_message(
-                callback.from_user.id, text, reply_markup=kb_main_menu()
-            )
+            if bot is not None:
+                await bot.send_message(
+                    callback.from_user.id, text, reply_markup=kb_main_menu()
+                )
         except TelegramAPIError:
             pass
     await callback.answer()
 
 
-async def _send_signal(telegram_id: int, chat_id: int, exclude_image: Optional[str] = None) -> bool:
+async def _send_signal(
+    telegram_id: int, chat_id: int, exclude_image: Optional[str] = None
+) -> bool:
     if bot is None:
         return False
     user = await db.get_user(telegram_id)
@@ -801,11 +874,14 @@ async def _send_signal(telegram_id: int, chat_id: int, exclude_image: Optional[s
         return True
     except TelegramAPIError as exc:
         logger.warning("send_signal telegram error for %s: %s", telegram_id, exc)
-        await bot.send_message(
-            chat_id,
-            "Не удалось отправить прогноз. Попробуйте ещё раз.",
-            reply_markup=kb_main_menu(),
-        )
+        try:
+            await bot.send_message(
+                chat_id,
+                "Не удалось отправить прогноз. Попробуйте ещё раз.",
+                reply_markup=kb_main_menu(),
+            )
+        except TelegramAPIError:
+            pass
         return False
     except Exception as exc:  # noqa: BLE001
         logger.exception("send_signal error: %s", exc)
@@ -831,7 +907,6 @@ async def cb_get_signal(callback: CallbackQuery) -> None:
         return
 
     await callback.answer()
-    # Убираем старое меню, чтобы не засорять чат
     try:
         if callback.message:
             await callback.message.delete()
@@ -861,7 +936,6 @@ async def cb_more_signal(callback: CallbackQuery) -> None:
     old_signal = await db.get_signal(signal_id)
     exclude_image = old_signal["image"] if old_signal else None
 
-    # Если предыдущий прогноз истёк — мягко сообщаем, но всё равно выдаём новый
     if old_signal:
         expires_at = str_to_dt(old_signal["expires_at"])
         if expires_at and utcnow() > expires_at:
@@ -910,59 +984,138 @@ async def fallback_message(message: Message) -> None:
 
 
 # ──────────────────────────────────────────────
-# Postback
+# Postback (1win)
 # ──────────────────────────────────────────────
 #
-# ⚠️ ЕДИНСТВЕННОЕ МЕСТО ДЛЯ АДАПТАЦИИ ПОД РЕАЛЬНЫЙ ФОРМАТ ПАРТНЁРКИ:
-# функция parse_postback_params() ниже.
-# После получения реального URL/формата postback — правьте ТОЛЬКО её.
+# ⚠️ МЕНЯТЬ ФОРМАТ ПАРАМЕТРОВ ЗДЕСЬ / в .env:
+#   POSTBACK_CLICK_ID_PARAM, POSTBACK_EVENT_PARAM,
+#   POSTBACK_SECRET_PARAM, POSTBACK_SUCCESS_EVENT
+#
+# Предполагаемый шаблон для кабинета 1win
+# (поле «Ссылка на постбэк события — Регистрация»):
+#
+#   {PUBLIC_BASE_URL}/postback?click_id={sub1}&event=registration&secret=YOUR_SECRET
+#
+# {sub1} — макрос 1win, куда партнёрка подставит значение sub1 из клика.
+# Точные имена макросов уточните в кабинете 1win — это НЕ финальная спецификация.
 
 
 def parse_postback_params(query: dict[str, str]) -> dict[str, Any]:
+    """Нормализует query-параметры postback под внутренний формат."""
+    click_id = (query.get(POSTBACK_CLICK_ID_PARAM) or "").strip()
+    # Запасные алиасы на случай другого имени в кабинете
+    if not click_id:
+        for alt in ("sub1", "subid", "sub_id", "clickid"):
+            if query.get(alt):
+                click_id = str(query[alt]).strip()
+                break
+
+    event = (query.get(POSTBACK_EVENT_PARAM) or "").strip().lower()
+    if not event:
+        for alt in ("status", "action", "type"):
+            if query.get(alt):
+                event = str(query[alt]).strip().lower()
+                break
+
+    secret = (query.get(POSTBACK_SECRET_PARAM) or "").strip()
+    if not secret:
+        for alt in ("token", "key", "sign"):
+            if query.get(alt):
+                secret = str(query[alt]).strip()
+                break
+
+    return {"click_id": click_id, "event": event, "secret": secret, "raw": query}
+
+
+async def process_postback(
+    *,
+    click_id: str,
+    event: str,
+    secret: str,
+    raw_data: str,
+    ip: Optional[str],
+) -> tuple[int, dict[str, Any]]:
     """
-    Нормализует входящие query-параметры postback.
-
-    Ожидаемый (гибкий) формат по умолчанию:
-      GET /postback?click_id=UUID&status=reg&secret=TOKEN
-      или
-      GET /postback?subid=UUID&event=reg&secret=TOKEN
-
-    Адаптируйте маппинг полей под вашу партнёрку здесь.
+    Единая точка обработки postback.
+    Возвращает (http_status, json_body).
     """
-    click_id = (
-        query.get("click_id")
-        or query.get("subid")
-        or query.get("sub_id")
-        or query.get("clickid")
-        or ""
-    ).strip()
+    # IP whitelist (опционально)
+    if POSTBACK_ALLOWED_IPS and ip and ip not in POSTBACK_ALLOWED_IPS:
+        await db.insert_postback(click_id, event, raw_data, ip, False, "ip_denied")
+        logger.warning("Postback denied by IP: %s", ip)
+        return 403, {"ok": False, "error": "forbidden"}
 
-    status = (
-        query.get("status")
-        or query.get("event")
-        or query.get("action")
-        or ""
-    ).strip().lower()
+    # Secret — только если задан в .env
+    if POSTBACK_SECRET and secret != POSTBACK_SECRET:
+        await db.insert_postback(click_id, event, raw_data, ip, False, "bad_secret")
+        logger.warning("Postback bad secret from %s", ip)
+        return 401, {"ok": False, "error": "unauthorized"}
 
-    secret = (
-        query.get("secret")
-        or query.get("token")
-        or query.get("key")
-        or ""
-    ).strip()
+    if not click_id:
+        await db.insert_postback(click_id, event, raw_data, ip, False, "missing_click_id")
+        logger.warning("Postback missing click_id from %s", ip)
+        return 400, {"ok": False, "error": "missing click_id"}
 
-    return {
-        "click_id": click_id,
-        "status": status,
-        "secret": secret,
-        "raw": query,
+    # Активируем ТОЛЬКО событие registration (не deposit / revenue / income)
+    if event != POSTBACK_SUCCESS_EVENT:
+        await db.insert_postback(click_id, event, raw_data, ip, False, "ignored_event")
+        logger.info(
+            "Postback ignored: event=%s (need %s) click_id=%s",
+            event,
+            POSTBACK_SUCCESS_EVENT,
+            click_id,
+        )
+        return 200, {
+            "ok": True,
+            "accepted": False,
+            "reason": "ignored_event",
+            "event": event,
+        }
+
+    user, newly = await db.activate_user(click_id)
+    if user is None:
+        await db.insert_postback(click_id, event, raw_data, ip, False, "unknown_click_id")
+        logger.warning("Postback unknown click_id=%s", click_id)
+        return 404, {"ok": False, "error": "user_not_found", "click_id": click_id}
+
+    if newly:
+        await db.insert_postback(click_id, event, raw_data, ip, True, "activated")
+        logger.info(
+            "User activated via postback: telegram_id=%s click_id=%s",
+            user["telegram_id"],
+            click_id,
+        )
+        if ADMIN_NOTIFY_ON_ACTIVATION:
+            await notify_admin(
+                "✅ <b>Регистрация подтверждена</b>\n\n"
+                f"ID: <code>{user['telegram_id']}</code>\n"
+                f"Username: @{user['username'] or '—'}\n"
+                f"Click ID: <code>{user['click_id']}</code>"
+            )
+        await schedule_activation_notification(int(user["telegram_id"]))
+        return 200, {
+            "ok": True,
+            "accepted": True,
+            "activated": True,
+            "telegram_id": user["telegram_id"],
+        }
+
+    # Повторный postback — идемпотентно
+    await db.insert_postback(click_id, event, raw_data, ip, True, "already_activated")
+    logger.info("Duplicate postback for click_id=%s (already activated)", click_id)
+    return 200, {
+        "ok": True,
+        "accepted": True,
+        "activated": False,
+        "already_activated": True,
+        "telegram_id": user["telegram_id"],
     }
 
 
 async def handle_postback(request: web.Request) -> web.Response:
     peer = request.remote or ""
-    query_raw = dict(request.rel_url.query)
-    # Также принимаем POST form/json (на будущее)
+    query_raw: dict[str, str] = {k: str(v) for k, v in request.rel_url.query.items()}
+
     if request.method == "POST":
         try:
             if request.content_type and "json" in request.content_type:
@@ -975,80 +1128,40 @@ async def handle_postback(request: web.Request) -> web.Response:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Postback body parse error: %s", exc)
 
-    parsed = parse_postback_params({k: str(v) for k, v in query_raw.items()})
-    click_id = parsed["click_id"]
-    status = parsed["status"]
-    secret = parsed["secret"]
-    raw_qs = str(request.rel_url.query)
+    parsed = parse_postback_params(query_raw)
+    raw_data = json.dumps(query_raw, ensure_ascii=False)
 
     logger.info(
-        "Postback received ip=%s click_id=%s status=%s qs=%s",
+        "Postback received ip=%s click_id=%s event=%s raw=%s",
         peer,
-        click_id,
-        status,
-        raw_qs,
+        parsed["click_id"],
+        parsed["event"],
+        raw_data,
     )
 
-    # IP whitelist (опционально)
-    if POSTBACK_ALLOWED_IPS and peer not in POSTBACK_ALLOWED_IPS:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "ip_denied")
-        logger.warning("Postback denied by IP: %s", peer)
-        return web.json_response({"ok": False, "error": "forbidden"}, status=403)
-
-    # Secret
-    if POSTBACK_SECRET and secret != POSTBACK_SECRET:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "bad_secret")
-        logger.warning("Postback bad secret from %s", peer)
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-
-    if not click_id:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "missing_click_id")
-        return web.json_response({"ok": False, "error": "missing click_id"}, status=400)
-
-    # Статус события
-    if status and status != POSTBACK_SUCCESS_STATUS:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "ignored_status")
-        return web.json_response({"ok": True, "accepted": False, "reason": "ignored_status"})
-
-    # Если статус пустой — считаем успешным (некоторые партнёрки шлют только click_id)
-    user_before = await db.get_user_by_click_id(click_id)
-    if user_before is None:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "user_not_found")
-        logger.warning("Postback: unknown click_id=%s", click_id)
-        return web.json_response({"ok": False, "error": "user_not_found"}, status=404)
-
-    already = bool(user_before["is_activated"])
-    user = await db.activate_user(click_id)
-    if user is None:
-        await db.log_postback(click_id, raw_qs, status, peer, False, "activate_failed")
-        return web.json_response({"ok": False, "error": "activate_failed"}, status=500)
-
-    await db.log_postback(click_id, raw_qs, status, peer, True, "ok" if not already else "already_activated")
-
-    if not already:
-        await notify_admin(
-            "✅ <b>Пользователь активирован</b>\n\n"
-            f"ID: <code>{user['telegram_id']}</code>\n"
-            f"Username: @{user['username'] or '—'}\n"
-            f"Click ID: <code>{user['click_id']}</code>"
+    try:
+        status, body = await process_postback(
+            click_id=parsed["click_id"],
+            event=parsed["event"],
+            secret=parsed["secret"],
+            raw_data=raw_data,
+            ip=peer,
         )
-        await schedule_activation_notification(int(user["telegram_id"]))
-        logger.info("User activated via postback: %s", user["telegram_id"])
-    else:
-        logger.info("Duplicate postback for click_id=%s (already activated)", click_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Postback processing error: %s", exc)
+        return web.json_response({"ok": False, "error": "internal"}, status=500)
 
-    return web.json_response(
-        {
-            "ok": True,
-            "accepted": True,
-            "already_activated": already,
-            "telegram_id": user["telegram_id"],
-        }
-    )
+    return web.json_response(body, status=status)
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "mineslot-bot"})
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "mineslot-bot",
+            "postback": postback_endpoint_url() if PUBLIC_BASE_URL else None,
+        }
+    )
 
 
 def create_http_app() -> web.Application:
@@ -1070,11 +1183,27 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан. Укажите его в .env")
 
+    url_error = validate_public_base_url(PUBLIC_BASE_URL)
+    if url_error:
+        raise SystemExit(url_error)
+
+    if not LANDING_URL:
+        raise SystemExit("LANDING_URL не задан. Укажите партнёрскую ссылку 1win в .env")
+
     db.init()
     images = list_signal_images()
     logger.info("Found %d signal images in %s", len(images), SIGNALS_DIR)
     if not images:
         logger.warning("Папка signals/ пуста — прогнозы выдавать нечего")
+
+    logger.info("1win landing base: %s", LANDING_URL)
+    logger.info("Postback URL for 1win cabinet: %s", postback_endpoint_url())
+    logger.info(
+        "Postback params: %s={sub1} %s=%s",
+        POSTBACK_CLICK_ID_PARAM,
+        POSTBACK_EVENT_PARAM,
+        POSTBACK_SUCCESS_EVENT,
+    )
 
     bot = Bot(token=BOT_TOKEN)
     http_app = create_http_app()
@@ -1082,12 +1211,18 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
     await site.start()
-    logger.info("HTTP postback server on http://%s:%s/postback", HTTP_HOST, HTTP_PORT)
+    logger.info(
+        "HTTP listening on http://%s:%s/postback (public: %s)",
+        HTTP_HOST,
+        HTTP_PORT,
+        postback_endpoint_url(),
+    )
 
     try:
         logger.info("Starting Telegram polling…")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        logger.info("Stopping…")
         for task in list(_pending_notifications.values()):
             task.cancel()
         await runner.cleanup()
@@ -1098,5 +1233,5 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Exit")
+    except (KeyboardInterrupt, SystemExit) as exc:
+        logger.info("Exit: %s", exc)
