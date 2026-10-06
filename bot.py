@@ -11,6 +11,7 @@ MineSlot Signal Bot — Telegram ↔ 1win postback MVP (aiogram 3.x + aiohttp).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -61,7 +62,11 @@ REFERRAL_URL = (
 )
 LANDING_URL = REFERRAL_URL  # алиас для совместимости
 
-# Публичный HTTPS URL сервера (без /postback в конце), например https://example.com
+# Публичный URL сервера БЕЗ /postback в конце.
+# Можно без домена — по IP VPS:
+#   http://1.2.3.4:8080
+# Или с доменом:
+#   https://myserver.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
@@ -95,12 +100,15 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+# true = разрешить http://IP:порт без покупки домена (порт должен быть открыт в firewall VPS)
+ALLOW_HTTP_IP = _env_bool("ALLOW_HTTP_IP", "true")
+
 ADMIN_NOTIFY_ON_NEW_USER = _env_bool("ADMIN_NOTIFY_ON_NEW_USER", "true")
 ADMIN_NOTIFY_ON_ACTIVATION = _env_bool("ADMIN_NOTIFY_ON_ACTIVATION", "true")
 ADMIN_NOTIFY_ON_SIGNAL = _env_bool("ADMIN_NOTIFY_ON_SIGNAL", "false")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-PRIVATE_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0", "192.168.", "10.")
+PRIVATE_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0")
 
 # ──────────────────────────────────────────────
 # Логирование
@@ -153,26 +161,96 @@ def format_local_date(dt: Optional[datetime] = None) -> str:
     return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
 
 
+def _is_public_ip(host: str) -> bool:
+    """Публичный IP = не localhost / не LAN / не link-local."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def validate_public_base_url(url: str) -> Optional[str]:
-    """Возвращает текст ошибки или None, если URL ок."""
+    """
+    Возвращает текст ошибки или None, если URL ок.
+
+    Разрешено:
+      - https://domain.com
+      - http://1.2.3.4:8080   (публичный IP VPS, без домена)
+      - https://1.2.3.4:8443
+    Запрещено:
+      - localhost / 127.0.0.1 / частные сети (192.168/10.x)
+    """
     if not url:
-        return "Для работы postback необходимо указать публичный HTTPS URL сервера."
+        return (
+            "Укажите PUBLIC_BASE_URL — адрес вашего VPS, куда 1win будет слать postback.\n"
+            "Пример без домена: http://ВАШ_IP:8080\n"
+            "Пример с доменом:  https://myserver.com"
+        )
+
     parsed = urlparse(url)
-    if parsed.scheme != "https":
-        return "PUBLIC_BASE_URL должен быть HTTPS (1win не достучится до HTTP/localhost)."
+    scheme = (parsed.scheme or "").lower()
     host = (parsed.hostname or "").lower()
+
+    if scheme not in {"http", "https"}:
+        return "PUBLIC_BASE_URL должен начинаться с http:// или https://"
     if not host:
         return "PUBLIC_BASE_URL указан некорректно."
-    if any(host == m or host.startswith(m) for m in PRIVATE_HOST_MARKERS):
+
+    if host in PRIVATE_HOST_MARKERS or host.endswith(".local"):
+        return "Нельзя использовать localhost. Нужен публичный IP VPS или домен."
+
+    is_ip = False
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+
+    if is_ip and not _is_public_ip(host):
         return (
-            "PUBLIC_BASE_URL не может быть localhost / 127.0.0.1 / частной сетью. "
-            "1win отправляет postback только на публичный HTTPS."
+            "IP из частной сети (192.168.x.x / 10.x.x.x) с интернета недоступен. "
+            "Укажите публичный IP вашего VPS."
         )
+
+    if scheme == "http":
+        if is_ip and ALLOW_HTTP_IP:
+            return None  # VPS по IP без домена — ок
+        if not is_ip and not ALLOW_HTTP_IP:
+            return (
+                "Для домена лучше HTTPS. Либо поставьте ALLOW_HTTP_IP=true, "
+                "либо укажите https://..."
+            )
+        if not is_ip and ALLOW_HTTP_IP:
+            return None
+        return (
+            "HTTP без публичного IP запрещён. Пример: http://ВАШ_IP:8080 "
+            "или купите домен и используйте https://"
+        )
+
     return None
 
 
 def postback_endpoint_url() -> str:
     return f"{PUBLIC_BASE_URL}/postback"
+
+
+def postback_url_for_1win_cabinet() -> str:
+    """Готовая строка для поля «Регистрация» в кабинете 1win."""
+    base = postback_endpoint_url()
+    parts = [
+        f"{POSTBACK_CLICK_ID_PARAM}={{sub1}}",
+        f"{POSTBACK_EVENT_PARAM}={POSTBACK_SUCCESS_EVENT}",
+    ]
+    if POSTBACK_SECRET:
+        parts.append(f"{POSTBACK_SECRET_PARAM}={POSTBACK_SECRET}")
+    return f"{base}?{'&'.join(parts)}"
 
 
 def build_referral_url(click_id: str) -> str:
@@ -1202,16 +1280,21 @@ async def main() -> None:
     images = list_signal_images()
     logger.info("Found %d signal images in %s", len(images), SIGNALS_DIR)
     if not images:
-        logger.warning("Папка signals/ пуста — прогнозы выдавать нечего")
+        logger.warning(
+            "Папка signals/ пуста — положите туда jpg/png/webp (хоть 1, хоть 8). "
+            "Бот сам берёт случайную картинку."
+        )
 
+    cabinet_url = postback_url_for_1win_cabinet()
     logger.info("1win referral URL: %s", REFERRAL_URL)
-    logger.info("Postback URL for 1win cabinet: %s", postback_endpoint_url())
-    logger.info(
-        "Postback params: %s={sub1} %s=%s",
-        POSTBACK_CLICK_ID_PARAM,
-        POSTBACK_EVENT_PARAM,
-        POSTBACK_SUCCESS_EVENT,
-    )
+    logger.info("PUBLIC_BASE_URL: %s", PUBLIC_BASE_URL)
+    logger.info(">>> Вставьте в кабинет 1win (Регистрация): %s", cabinet_url)
+    if urlparse(PUBLIC_BASE_URL).scheme == "http":
+        logger.warning(
+            "Используется HTTP по IP (без домена). Откройте порт %s в firewall VPS. "
+            "Если 1win отвергнет HTTP — понадобится HTTPS/домен.",
+            HTTP_PORT,
+        )
 
     bot = Bot(token=BOT_TOKEN)
     http_app = create_http_app()
@@ -1220,10 +1303,9 @@ async def main() -> None:
     site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
     await site.start()
     logger.info(
-        "HTTP listening on http://%s:%s/postback (public: %s)",
+        "Postback endpoint listening: http://%s:%s/postback",
         HTTP_HOST,
         HTTP_PORT,
-        postback_endpoint_url(),
     )
 
     try:

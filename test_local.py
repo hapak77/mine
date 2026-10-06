@@ -16,7 +16,8 @@ os.environ["ADMIN_ID"] = "1"
 os.environ["LANDING_URL"] = (
     "https://r1wtvmb.life/casino/list?open=register&p=fiyw"
 )
-os.environ["PUBLIC_BASE_URL"] = "https://bot.example.com"
+os.environ["PUBLIC_BASE_URL"] = "http://8.8.8.8:8080"
+os.environ["ALLOW_HTTP_IP"] = "true"
 os.environ["POSTBACK_SECRET"] = "testsecret"
 os.environ["POSTBACK_SUCCESS_EVENT"] = "registration"
 os.environ["POSTBACK_CLICK_ID_PARAM"] = "click_id"
@@ -51,19 +52,29 @@ async def run_tests() -> int:
     app.db = app.Database(db_path)
     app.db.init()
 
-    # 1. PUBLIC_BASE_URL validation
-    check("public url ok", app.validate_public_base_url("https://bot.example.com") is None)
+    # 1. PUBLIC_BASE_URL validation (IP без домена разрешён)
+    check("https domain ok", app.validate_public_base_url("https://bot.example.com") is None)
+    check(
+        "http public IP ok",
+        app.validate_public_base_url("http://8.8.8.8:8080") is None,
+    )
     check(
         "localhost rejected",
-        app.validate_public_base_url("https://localhost") is not None,
+        app.validate_public_base_url("http://127.0.0.1:8080") is not None,
+    )
+    check(
+        "private IP rejected",
+        app.validate_public_base_url("http://192.168.1.5:8080") is not None,
     )
     check(
         "empty public url rejected",
         app.validate_public_base_url("") is not None,
     )
+    cabinet = app.postback_url_for_1win_cabinet()
     check(
-        "http rejected",
-        app.validate_public_base_url("http://bot.example.com") is not None,
+        "cabinet postback url contains click_id={sub1}",
+        "click_id={sub1}" in cabinet and "event=registration" in cabinet,
+        cabinet,
     )
 
     # 2–4. create user + click_id + landing with sub1
