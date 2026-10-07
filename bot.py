@@ -246,15 +246,15 @@ def postback_endpoint_url() -> str:
 
 
 def postback_url_for_1win_cabinet() -> str:
-    """Готовая строка для поля «Регистрация» в кабинете 1win."""
+    """
+    Готовая строка для поля «Регистрация» в кабинете 1win.
+
+    Минимальный формат (1win часто ругается на лишние параметры / http / IP):
+      https://ВАШ_ДОМЕН/postback?sub1={sub1}
+    """
     base = postback_endpoint_url()
-    parts = [
-        f"{POSTBACK_CLICK_ID_PARAM}={{sub1}}",
-        f"{POSTBACK_EVENT_PARAM}={POSTBACK_SUCCESS_EVENT}",
-    ]
-    if POSTBACK_SECRET:
-        parts.append(f"{POSTBACK_SECRET_PARAM}={POSTBACK_SECRET}")
-    return f"{base}?{'&'.join(parts)}"
+    # sub1={sub1} — самый совместимый вариант для 1win
+    return f"{base}?sub1={{sub1}}"
 
 
 def build_referral_url(click_id: str) -> str:
