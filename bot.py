@@ -625,7 +625,6 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎯 Получить прогноз", callback_data="get_signal")],
-            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="info")],
         ]
     )
 
@@ -823,8 +822,10 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         else:
             await message.answer(
                 "👋 Добро пожаловать!\n\n"
-                "Для активации бота необходимо пройти регистрацию.\n\n"
-                "После успешной регистрации доступ будет активирован автоматически.",
+                "Чтобы получать корректные прогнозы, нужно зарегистрироваться "
+                "по кнопке ниже.\n\n"
+                "Так бот сможет привязать ваш аккаунт и открыть доступ к сигналам.\n\n"
+                "После регистрации доступ активируется автоматически.",
                 reply_markup=kb_register(user["click_id"]),
             )
             if is_new:
@@ -906,38 +907,6 @@ async def cmd_users(message: Message) -> None:
 @dp.callback_query(F.data == "register_no_url")
 async def cb_register_no_url(callback: CallbackQuery) -> None:
     await callback.answer("REFERRAL_URL не задан. Укажите его в .env", show_alert=True)
-
-
-@dp.callback_query(F.data == "info")
-async def cb_info(callback: CallbackQuery) -> None:
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    user = await db.get_user(callback.from_user.id)
-    if user is None or not can_use_bot(user, callback.from_user.id):
-        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
-        return
-    await db.touch_activity(callback.from_user.id)
-    text = (
-        "ℹ️ <b>Информация</b>\n\n"
-        "Бот выдаёт случайный контент-прогноз на ближайшую игру.\n"
-        f"Каждый прогноз действует {SIGNAL_LIFETIME // 60} минуты.\n\n"
-        "Доступ открывается автоматически после подтверждённой регистрации."
-    )
-    try:
-        if callback.message:
-            await callback.message.edit_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
-                    ]
-                ),
-            )
-    except TelegramAPIError as exc:
-        logger.warning("cb_info edit failed: %s", exc)
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "back_main")
@@ -1120,7 +1089,8 @@ async def fallback_message(message: Message) -> None:
         return
     if not can_use_bot(user, message.from_user.id):
         await message.answer(
-            "Для активации бота необходимо пройти регистрацию.",
+            "Чтобы получать корректные прогнозы, зарегистрируйтесь по кнопке ниже.\n"
+            "Так бот привяжет ваш аккаунт и откроет доступ.",
             reply_markup=kb_register(user["click_id"]),
         )
         return
