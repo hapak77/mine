@@ -1203,11 +1203,13 @@ async def process_postback(
         logger.warning("Postback missing click_id from %s", ip)
         return 400, {"ok": False, "error": "missing click_id"}
 
-    # Активируем ТОЛЬКО событие registration (не deposit / revenue / income)
-    if event != POSTBACK_SUCCESS_EVENT:
+    # Пустой event = ок: поле в кабинете уже «Регистрация», 1win часто
+    # шлёт только sub1 без event=...
+    # Явные deposit/revenue/income — не активируем.
+    if event and event != POSTBACK_SUCCESS_EVENT:
         await db.insert_postback(click_id, event, raw_data, ip, False, "ignored_event")
         logger.info(
-            "Postback ignored: event=%s (need %s) click_id=%s",
+            "Postback ignored: event=%s (need %s or empty) click_id=%s",
             event,
             POSTBACK_SUCCESS_EVENT,
             click_id,
