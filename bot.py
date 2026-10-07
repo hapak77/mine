@@ -107,6 +107,10 @@ ADMIN_NOTIFY_ON_NEW_USER = _env_bool("ADMIN_NOTIFY_ON_NEW_USER", "true")
 ADMIN_NOTIFY_ON_ACTIVATION = _env_bool("ADMIN_NOTIFY_ON_ACTIVATION", "true")
 ADMIN_NOTIFY_ON_SIGNAL = _env_bool("ADMIN_NOTIFY_ON_SIGNAL", "false")
 
+# true = можно пользоваться ботом БЕЗ регистрации (для теста на Mac / админа)
+# На боевом сервере поставьте false
+DEV_SKIP_ACTIVATION = _env_bool("DEV_SKIP_ACTIVATION", "false")
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PRIVATE_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0")
 
@@ -714,6 +718,41 @@ async def schedule_activation_notification(telegram_id: int) -> None:
 # ──────────────────────────────────────────────
 
 
+def is_admin(telegram_id: int) -> bool:
+    return bool(ADMIN_ID) and telegram_id == ADMIN_ID
+
+
+def can_use_bot(user: Optional[sqlite3.Row], telegram_id: int) -> bool:
+    """Доступ: активирован postback'ом, либо админ, либо DEV_SKIP_ACTIVATION."""
+    if user is not None and user["is_activated"]:
+        return True
+    if is_admin(telegram_id):
+        return True
+    if DEV_SKIP_ACTIVATION:
+        return True
+    return False
+
+
+async def ensure_dev_access(user: sqlite3.Row) -> sqlite3.Row:
+    """
+    Для теста/админа: сразу активируем в БД, чтобы меню и прогнозы работали
+    без реального postback от 1win.
+    """
+    if user["is_activated"]:
+        return user
+    if not (is_admin(int(user["telegram_id"])) or DEV_SKIP_ACTIVATION):
+        return user
+    activated, _newly = await db.activate_user(user["click_id"])
+    if activated is not None:
+        await db.mark_activation_notification_sent(int(user["telegram_id"]))
+        logger.info(
+            "Dev/admin access granted without postback: telegram_id=%s",
+            user["telegram_id"],
+        )
+        return activated
+    return user
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     if message.from_user is None:
@@ -765,14 +804,20 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
         assert user is not None
 
-        if user["is_activated"]:
-            # Если пользователь уже открыл бота после активации —
-            # помечаем уведомление отправленным, чтобы отложенный дубль не ушёл
-            if not user["activation_notification_sent"]:
+        # Админ или DEV_SKIP_ACTIVATION — смотрим бота без регистрации 1win
+        if can_use_bot(user, tg.id) and not user["is_activated"]:
+            user = await ensure_dev_access(user)
+
+        if can_use_bot(user, tg.id):
+            if user["is_activated"] and not user["activation_notification_sent"]:
                 await db.mark_activation_notification_sent(tg.id)
+            note = ""
+            if DEV_SKIP_ACTIVATION or is_admin(tg.id):
+                note = "\n\n🧪 Тестовый доступ без регистрации."
             await message.answer(
                 "✅ Доступ активирован!\n\n"
-                "Теперь вы можете получать прогнозы на ближайшие игры.",
+                "Теперь вы можете получать прогнозы на ближайшие игры."
+                f"{note}",
                 reply_markup=kb_main_menu(),
             )
         else:
@@ -794,6 +839,22 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
             await message.answer("Произошла ошибка. Попробуйте позже.")
         except TelegramAPIError:
             pass
+
+
+@dp.message(Command("unlock"))
+async def cmd_unlock(message: Message) -> None:
+    """Админ: открыть себе доступ без регистрации (/unlock)."""
+    if message.from_user is None or not is_admin(message.from_user.id):
+        return
+    user = await db.get_user(message.from_user.id)
+    if user is None:
+        await message.answer("Сначала нажмите /start")
+        return
+    user = await ensure_dev_access(user)
+    await message.answer(
+        "🧪 Тестовый доступ открыт без регистрации.",
+        reply_markup=kb_main_menu(),
+    )
 
 
 @dp.message(Command("stats"))
@@ -853,7 +914,7 @@ async def cb_info(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     user = await db.get_user(callback.from_user.id)
-    if user is None or not user["is_activated"]:
+    if user is None or not can_use_bot(user, callback.from_user.id):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await db.touch_activity(callback.from_user.id)
@@ -885,7 +946,7 @@ async def cb_back_main(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     user = await db.get_user(callback.from_user.id)
-    if user is None or not user["is_activated"]:
+    if user is None or not can_use_bot(user, callback.from_user.id):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await db.touch_activity(callback.from_user.id)
@@ -925,7 +986,7 @@ async def _send_signal(
     if bot is None:
         return False
     user = await db.get_user(telegram_id)
-    if user is None or not user["is_activated"]:
+    if user is None or not can_use_bot(user, telegram_id):
         return False
 
     image_path = pick_signal_image(exclude=exclude_image)
@@ -988,7 +1049,7 @@ async def cb_get_signal(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     user = await db.get_user(callback.from_user.id)
-    if user is None or not user["is_activated"]:
+    if user is None or not can_use_bot(user, callback.from_user.id):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
 
@@ -1009,7 +1070,7 @@ async def cb_more_signal(callback: CallbackQuery) -> None:
         return
 
     user = await db.get_user(callback.from_user.id)
-    if user is None or not user["is_activated"]:
+    if user is None or not can_use_bot(user, callback.from_user.id):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
 
@@ -1057,7 +1118,7 @@ async def fallback_message(message: Message) -> None:
     if user is None:
         await message.answer("Нажмите /start для начала.")
         return
-    if not user["is_activated"]:
+    if not can_use_bot(user, message.from_user.id):
         await message.answer(
             "Для активации бота необходимо пройти регистрацию.",
             reply_markup=kb_register(user["click_id"]),
