@@ -107,10 +107,6 @@ ADMIN_NOTIFY_ON_NEW_USER = _env_bool("ADMIN_NOTIFY_ON_NEW_USER", "true")
 ADMIN_NOTIFY_ON_ACTIVATION = _env_bool("ADMIN_NOTIFY_ON_ACTIVATION", "true")
 ADMIN_NOTIFY_ON_SIGNAL = _env_bool("ADMIN_NOTIFY_ON_SIGNAL", "false")
 
-# true = можно пользоваться ботом БЕЗ регистрации (для теста на Mac / админа)
-# На боевом сервере поставьте false
-DEV_SKIP_ACTIVATION = _env_bool("DEV_SKIP_ACTIVATION", "false")
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PRIVATE_HOST_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0")
 
@@ -722,30 +718,25 @@ def is_admin(telegram_id: int) -> bool:
 
 
 def can_use_bot(user: Optional[sqlite3.Row], telegram_id: int) -> bool:
-    """Доступ: активирован postback'ом, либо админ, либо DEV_SKIP_ACTIVATION."""
+    """Доступ: активирован postback'ом, либо админ (без регистрации)."""
     if user is not None and user["is_activated"]:
         return True
     if is_admin(telegram_id):
         return True
-    if DEV_SKIP_ACTIVATION:
-        return True
     return False
 
 
-async def ensure_dev_access(user: sqlite3.Row) -> sqlite3.Row:
-    """
-    Для теста/админа: сразу активируем в БД, чтобы меню и прогнозы работали
-    без реального postback от 1win.
-    """
+async def ensure_admin_access(user: sqlite3.Row) -> sqlite3.Row:
+    """Только для ADMIN_ID: доступ без postback от 1win."""
     if user["is_activated"]:
         return user
-    if not (is_admin(int(user["telegram_id"])) or DEV_SKIP_ACTIVATION):
+    if not is_admin(int(user["telegram_id"])):
         return user
     activated, _newly = await db.activate_user(user["click_id"])
     if activated is not None:
         await db.mark_activation_notification_sent(int(user["telegram_id"]))
         logger.info(
-            "Dev/admin access granted without postback: telegram_id=%s",
+            "Admin access granted without postback: telegram_id=%s",
             user["telegram_id"],
         )
         return activated
@@ -803,16 +794,14 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 
         assert user is not None
 
-        # Админ или DEV_SKIP_ACTIVATION — смотрим бота без регистрации 1win
-        if can_use_bot(user, tg.id) and not user["is_activated"]:
-            user = await ensure_dev_access(user)
+        # Только админ может зайти без регистрации 1win
+        if is_admin(tg.id) and not user["is_activated"]:
+            user = await ensure_admin_access(user)
 
         if can_use_bot(user, tg.id):
             if user["is_activated"] and not user["activation_notification_sent"]:
                 await db.mark_activation_notification_sent(tg.id)
-            note = ""
-            if DEV_SKIP_ACTIVATION or is_admin(tg.id):
-                note = "\n\n🧪 Тестовый доступ без регистрации."
+            note = "\n\n🧪 Админ-доступ без регистрации." if is_admin(tg.id) else ""
             await message.answer(
                 "✅ Доступ активирован!\n\n"
                 "Теперь вы можете получать прогнозы на ближайшие игры."
@@ -851,9 +840,9 @@ async def cmd_unlock(message: Message) -> None:
     if user is None:
         await message.answer("Сначала нажмите /start")
         return
-    user = await ensure_dev_access(user)
+    user = await ensure_admin_access(user)
     await message.answer(
-        "🧪 Тестовый доступ открыт без регистрации.",
+        "🧪 Админ-доступ открыт без регистрации.",
         reply_markup=kb_main_menu(),
     )
 
