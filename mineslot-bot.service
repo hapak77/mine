@@ -1,0 +1,18 @@
+[Unit]
+Description=MineSlot Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mine
+Environment=PATH=/root/mine/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/root/mine/venv/bin/python /root/mine/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/mine/bot_run.log
+StandardError=append:/root/mine/bot_run.log
+
+[Install]
+WantedBy=multi-user.target

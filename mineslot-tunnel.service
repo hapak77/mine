@@ -1,0 +1,18 @@
+[Unit]
+Description=Cloudflare Tunnel for MineSlot postback
+After=network-online.target mineslot-bot.service
+Wants=network-online.target
+Requires=mineslot-bot.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mine
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8080
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/mine/cloudflared.log
+StandardError=append:/root/mine/cloudflared.log
+
+[Install]
+WantedBy=multi-user.target
