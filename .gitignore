@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/
+nginx/ssl/*
+!nginx/ssl/.gitkeep
+.pytest_cache/
+*.egg-info/
+.mypy_cache/
